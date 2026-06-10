@@ -1,4 +1,4 @@
-import os, base64, json, subprocess, tempfile, urllib.request, urllib.error, io
+import os, base64, json, subprocess, tempfile, urllib.request, urllib.error, io, glob
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -13,19 +13,22 @@ IV       = int(os.environ.get("INTERVAL_MS", "10000"))
 def health():
     return jsonify({"status": "ok", "service": "WHS Converter"})
 
-@app.route("/convert", methods=["POST"])
-def convert():
+@app.route("/process", methods=["POST"])
+def process():
+    """Baixa o pptx do GitHub, converte e publica"""
     try:
         data = request.get_json(force=True)
-        pptx_b64 = data.get("pptx")
-        name     = data.get("name", "Apresentação")
-        action   = data.get("action", "add")
+        gh_path = data.get("gh_path")   # ex: "uploads/minha_apres.pptx"
+        name    = data.get("name", "Apresentação")
+        action  = data.get("action", "add")
         replace_id = data.get("replace_id", None)
 
-        if not pptx_b64:
-            return jsonify({"error": "pptx ausente"}), 400
+        if not gh_path:
+            return jsonify({"error": "gh_path ausente"}), 400
 
-        pptx_bytes = base64.b64decode(pptx_b64)
+        # Baixar o pptx do GitHub
+        r = gh_get(f"contents/{gh_path}")
+        pptx_bytes = base64.b64decode(r["content"].replace("\n",""))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             pptx_path = os.path.join(tmpdir, "input.pptx")
@@ -37,18 +40,20 @@ def convert():
         if not slides_b64:
             return jsonify({"error": "Nenhum slide gerado"}), 500
 
+        # Deletar o pptx do GitHub após processar
+        try:
+            gh_delete(gh_path, r["sha"])
+        except: pass
+
         state = load_state()
         from datetime import datetime
         now = datetime.now().strftime("%d/%m/%Y %H:%M")
         pres_id = "p" + str(int(datetime.now().timestamp() * 1000))
 
         new_pres = {
-            "id": pres_id,
-            "name": name,
-            "date": now,
+            "id": pres_id, "name": name, "date": now,
             "slideCount": len(slides_b64),
-            "thumb": slides_b64[0],
-            "slides": slides_b64
+            "thumb": slides_b64[0], "slides": slides_b64
         }
 
         if action == "replace_id" and replace_id:
@@ -58,171 +63,11 @@ def convert():
         save_state(state)
         rebuild_tv(state)
 
-        return jsonify({
-            "ok": True,
-            "id": pres_id,
-            "name": name,
-            "slideCount": len(slides_b64),
-            "thumb": slides_b64[0]
-        })
+        return jsonify({"ok": True, "id": pres_id, "name": name, "slideCount": len(slides_b64), "thumb": slides_b64[0]})
 
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-
-def convert_pptx(pptx_path, tmpdir):
-    """Try LibreOffice first, fall back to python-pptx rendering"""
-    # Try LibreOffice
-    lo_paths = [
-        "libreoffice", "soffice",
-        "/usr/bin/libreoffice", "/usr/bin/soffice",
-        "/opt/libreoffice/program/soffice"
-    ]
-    lo_cmd = None
-    for p in lo_paths:
-        try:
-            r = subprocess.run([p, "--version"], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                lo_cmd = p
-                break
-        except: continue
-
-    if lo_cmd:
-        return convert_via_libreoffice(lo_cmd, pptx_path, tmpdir)
-    else:
-        return convert_via_python(pptx_path)
-
-
-def convert_via_libreoffice(lo_cmd, pptx_path, tmpdir):
-    import glob
-    subprocess.run(
-        [lo_cmd, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, pptx_path],
-        capture_output=True, timeout=120
-    )
-    pdf_path = os.path.join(tmpdir, "input.pdf")
-    if not os.path.exists(pdf_path):
-        raise Exception("LibreOffice não gerou PDF")
-
-    subprocess.run(
-        ["pdftoppm", "-jpeg", "-r", "120", pdf_path, os.path.join(tmpdir, "slide")],
-        capture_output=True, timeout=120
-    )
-    slide_files = sorted(glob.glob(os.path.join(tmpdir, "slide-*.jpg")))
-    slides_b64 = []
-    for sf in slide_files:
-        with open(sf, "rb") as f:
-            slides_b64.append(base64.b64encode(f.read()).decode())
-    return slides_b64
-
-
-def convert_via_python(pptx_path):
-    """Render slides using python-pptx + Pillow"""
-    from pptx import Presentation
-    from pptx.util import Pt
-    from PIL import Image, ImageDraw, ImageFont
-    import re
-
-    prs = Presentation(pptx_path)
-    W, H = 1280, 720
-    slides_b64 = []
-
-    for slide_num, slide in enumerate(prs.slides):
-        img = Image.new("RGB", (W, H), color=(13, 48, 128))
-        draw = ImageDraw.Draw(img)
-
-        # Try to get background color from slide
-        bg_color = (13, 48, 128)
-        try:
-            bg = slide.background
-            fill = bg.fill
-            if fill.type is not None:
-                from pptx.dml.color import RGBColor
-                if hasattr(fill, 'fore_color') and fill.fore_color.rgb:
-                    c = fill.fore_color.rgb
-                    bg_color = (c.red, c.green, c.blue)
-        except: pass
-
-        img = Image.new("RGB", (W, H), color=bg_color)
-        draw = ImageDraw.Draw(img)
-
-        # Draw accent bar
-        draw.rectangle([0, H-6, W, H], fill=(77, 166, 255))
-        draw.rectangle([0, 0, 6, H], fill=(77, 166, 255, 128))
-
-        # Try to draw background images first
-        for shape in slide.shapes:
-            try:
-                if shape.shape_type == 13:  # Picture
-                    from PIL import Image as PILImage
-                    img_data = shape.image.blob
-                    pic = PILImage.open(io.BytesIO(img_data)).convert("RGB")
-                    # Check if it's a large background image
-                    sl = slide.slide_layout.slide_master
-                    sw = prs.slide_width
-                    sh = prs.slide_height
-                    from pptx.util import Emu
-                    x = int(shape.left / sw * W) if shape.left else 0
-                    y = int(shape.top / sh * H) if shape.top else 0
-                    w = int(shape.width / sw * W) if shape.width else W
-                    h = int(shape.height / sh * H) if shape.height else H
-                    pic_resized = pic.resize((w, h), PILImage.LANCZOS)
-                    img.paste(pic_resized, (x, y))
-            except: pass
-
-        draw = ImageDraw.Draw(img)
-
-        # Draw text
-        texts = []
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text.strip():
-                texts.append(shape.text.strip())
-
-        y_pos = 60
-        for i, text in enumerate(texts[:8]):
-            if y_pos > 660: break
-            clean = re.sub(r'\s+', ' ', text)[:200]
-            if i == 0:
-                font_size = 52 if len(clean) < 30 else 40 if len(clean) < 50 else 32
-                color = (255, 255, 255)
-            elif i == 1:
-                font_size = 28
-                color = (200, 220, 255)
-            else:
-                font_size = 22
-                color = (180, 200, 230)
-                draw.ellipse([60, y_pos-8, 74, y_pos+6], fill=(77, 166, 255))
-
-            # Word wrap
-            words = clean.split()
-            lines = []
-            line = ""
-            max_chars = max(20, int(W * 0.7 / (font_size * 0.55)))
-            for w in words:
-                test = (line + " " + w).strip()
-                if len(test) > max_chars and line:
-                    lines.append(line)
-                    line = w
-                else:
-                    line = test
-            if line: lines.append(line)
-
-            for ln in lines[:4]:
-                if y_pos > 680: break
-                x_pos = 85 if i >= 2 else 60
-                draw.text((x_pos, y_pos), ln, fill=color)
-                y_pos += int(font_size * 1.3)
-            y_pos += 8
-
-        # Slide number
-        total = len(prs.slides)
-        draw.text((W-80, H-28), f"{slide_num+1}/{total}", fill=(100, 120, 150))
-
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        slides_b64.append(base64.b64encode(buf.getvalue()).decode())
-
-    return slides_b64
 
 
 @app.route("/delete", methods=["POST"])
@@ -252,10 +97,107 @@ def get_state():
         return jsonify({"presentations": [], "error": str(e)})
 
 
+def convert_pptx(pptx_path, tmpdir):
+    lo_paths = ["libreoffice","soffice","/usr/bin/libreoffice","/usr/bin/soffice"]
+    lo_cmd = None
+    for p in lo_paths:
+        try:
+            r = subprocess.run([p,"--version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                lo_cmd = p; break
+        except: continue
+
+    if lo_cmd:
+        return convert_via_libreoffice(lo_cmd, pptx_path, tmpdir)
+    return convert_via_python(pptx_path)
+
+
+def convert_via_libreoffice(lo_cmd, pptx_path, tmpdir):
+    subprocess.run([lo_cmd,"--headless","--convert-to","pdf","--outdir",tmpdir,pptx_path], capture_output=True, timeout=180)
+    pdf_path = os.path.join(tmpdir, "input.pdf")
+    if not os.path.exists(pdf_path):
+        raise Exception("LibreOffice não gerou PDF")
+    subprocess.run(["pdftoppm","-jpeg","-r","120",pdf_path,os.path.join(tmpdir,"slide")], capture_output=True, timeout=120)
+    slide_files = sorted(glob.glob(os.path.join(tmpdir, "slide-*.jpg")))
+    slides_b64 = []
+    for sf in slide_files:
+        with open(sf,"rb") as f:
+            slides_b64.append(base64.b64encode(f.read()).decode())
+    return slides_b64
+
+
+def convert_via_python(pptx_path):
+    from pptx import Presentation
+    from PIL import Image, ImageDraw
+    import re
+
+    prs = Presentation(pptx_path)
+    W, H = 1280, 720
+    slides_b64 = []
+
+    for slide_num, slide in enumerate(prs.slides):
+        bg_color = (13, 48, 128)
+        try:
+            fill = slide.background.fill
+            if fill.type is not None and hasattr(fill,'fore_color'):
+                c = fill.fore_color.rgb
+                bg_color = (c.red, c.green, c.blue)
+        except: pass
+
+        img = Image.new("RGB", (W,H), color=bg_color)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0,H-6,W,H], fill=(77,166,255))
+        draw.rectangle([0,0,6,H], fill=(50,120,200))
+
+        # Draw images from slide
+        for shape in slide.shapes:
+            try:
+                if shape.shape_type == 13:
+                    pic = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
+                    sw, sh = prs.slide_width, prs.slide_height
+                    x = int(shape.left/sw*W) if shape.left else 0
+                    y = int(shape.top/sh*H) if shape.top else 0
+                    w = int(shape.width/sw*W) if shape.width else W
+                    h = int(shape.height/sh*H) if shape.height else H
+                    img.paste(pic.resize((w,h), Image.LANCZOS), (x,y))
+            except: pass
+
+        draw = ImageDraw.Draw(img)
+        texts = [s.text.strip() for s in slide.shapes if hasattr(s,"text") and s.text.strip()]
+        y_pos = 60
+        for i, text in enumerate(texts[:8]):
+            if y_pos > 660: break
+            clean = re.sub(r'\s+',' ',text)[:200]
+            color = (255,255,255) if i==0 else (200,220,255) if i==1 else (180,200,230)
+            if i >= 2:
+                draw.ellipse([60,y_pos-8,74,y_pos+6], fill=(77,166,255))
+            fs = 52 if i==0 and len(clean)<30 else 40 if i==0 else 26 if i==1 else 20
+            words = clean.split()
+            lines, line = [], ""
+            for w in words:
+                test = (line+" "+w).strip()
+                if len(test) > max(20, int(W*0.65/(fs*0.55))) and line:
+                    lines.append(line); line = w
+                else: line = test
+            if line: lines.append(line)
+            for ln in lines[:4]:
+                if y_pos > 680: break
+                draw.text((85 if i>=2 else 60, y_pos), ln, fill=color)
+                y_pos += int(fs*1.3)
+            y_pos += 8
+
+        draw.text((W-80,H-28), f"{slide_num+1}/{len(prs.slides)}", fill=(100,120,150))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        slides_b64.append(base64.b64encode(buf.getvalue()).decode())
+
+    return slides_b64
+
+
 def gh_get(path):
     req = urllib.request.Request(
         f"https://api.github.com/repos/{GH_REPO}/{path}",
-        headers={"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        headers={"Authorization":f"token {GH_TOKEN}","Accept":"application/vnd.github.v3+json"}
     )
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
@@ -263,15 +205,37 @@ def gh_get(path):
 def gh_put(path, content_str, message="WHS Update"):
     content_b64 = base64.b64encode(content_str.encode()).decode()
     sha = None
-    try:
-        cur = gh_get(path)
-        sha = cur.get("sha")
+    try: sha = gh_get(path).get("sha")
     except: pass
-    body = json.dumps({"message": message, "content": content_b64, **({"sha": sha} if sha else {})}).encode()
+    body = json.dumps({"message":message,"content":content_b64,**({"sha":sha} if sha else {})}).encode()
     req = urllib.request.Request(
         f"https://api.github.com/repos/{GH_REPO}/contents/{path}",
         data=body, method="PUT",
-        headers={"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
+        headers={"Authorization":f"token {GH_TOKEN}","Accept":"application/vnd.github.v3+json","Content-Type":"application/json"}
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+def gh_put_bytes(path, content_bytes, message="Upload"):
+    content_b64 = base64.b64encode(content_bytes).decode()
+    sha = None
+    try: sha = gh_get(path).get("sha")
+    except: pass
+    body = json.dumps({"message":message,"content":content_b64,**({"sha":sha} if sha else {})}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{GH_REPO}/contents/{path}",
+        data=body, method="PUT",
+        headers={"Authorization":f"token {GH_TOKEN}","Accept":"application/vnd.github.v3+json","Content-Type":"application/json"}
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+def gh_delete(path, sha):
+    body = json.dumps({"message":"Remove temp pptx","sha":sha}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{GH_REPO}/contents/{path}",
+        data=body, method="DELETE",
+        headers={"Authorization":f"token {GH_TOKEN}","Accept":"application/vnd.github.v3+json","Content-Type":"application/json"}
     )
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
@@ -280,20 +244,17 @@ def load_state():
     try:
         r = gh_get("contents/state.json")
         return json.loads(base64.b64decode(r["content"].replace("\n","")).decode())
-    except:
-        return []
+    except: return []
 
 def save_state(state):
-    meta = [{"id": p["id"], "name": p["name"], "date": p["date"],
-             "slideCount": p["slideCount"], "thumb": p["thumb"]} for p in state]
-    gh_put("state.json", json.dumps({"presentations": meta}))
+    meta = [{"id":p["id"],"name":p["name"],"date":p["date"],"slideCount":p["slideCount"],"thumb":p["thumb"]} for p in state]
+    gh_put("state.json", json.dumps({"presentations":meta}))
 
 def rebuild_tv(state):
     all_slides = []
     for p in state:
-        all_slides.extend(p.get("slides", []))
-    html = build_tv_html(all_slides, state)
-    gh_put("index.html", html)
+        all_slides.extend(p.get("slides",[]))
+    gh_put("index.html", build_tv_html(all_slides, state))
 
 def build_tv_html(slides_b64, pres_list):
     total = len(slides_b64)
@@ -337,7 +298,6 @@ document.addEventListener('mousemove',shUI);document.addEventListener('touchstar
 document.addEventListener('keydown',e=>{{shUI();switch(e.key){{case'ArrowRight':case'ArrowDown':case'PageDown':e.preventDefault();gt(C+1);break;case'ArrowLeft':case'ArrowUp':case'PageUp':e.preventDefault();gt(C-1);break;case' ':e.preventDefault();setP(!P);break;case'p':case'P':setP(!P);break;case'f':case'F':tFS();break;}}}});
 let tx=null;document.addEventListener('touchstart',e=>{{tx=e.touches[0].clientX;}});document.addEventListener('touchend',e=>{{if(tx===null)return;const dx=e.changedTouches[0].clientX-tx;if(Math.abs(dx)>50){{dx<0?gt(C+1):gt(C-1);}}tx=null;}});
 <\/script></body></html>"""
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
