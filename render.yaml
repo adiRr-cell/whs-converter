@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: whs-converter
+    runtime: python
+    buildCommand: apt-get install -y libreoffice poppler-utils && pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 180
+    envVars:
+      - key: GH_TOKEN
+        sync: false
+      - key: GH_REPO
+        value: adiRr-cell/forum-zero
+      - key: INTERVAL_MS
+        value: "10000"
