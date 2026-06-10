@@ -26,9 +26,9 @@ def process():
         if not gh_path:
             return jsonify({"error": "gh_path ausente"}), 400
 
-        # Baixar o pptx do GitHub
-        r = gh_get(f"contents/{gh_path}")
-        pptx_bytes = base64.b64decode(r["content"].replace("\n",""))
+        # Baixar o pptx do GitHub (suporta arquivos grandes)
+        pptx_bytes = gh_get_file_bytes(f"contents/{gh_path}")
+        r = gh_get(f"contents/{gh_path}")  # get sha for deletion
 
         with tempfile.TemporaryDirectory() as tmpdir:
             pptx_path = os.path.join(tmpdir, "input.pptx")
@@ -201,6 +201,20 @@ def gh_get(path):
     )
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
+
+def gh_get_file_bytes(path):
+    """Download file bytes - handles large files via download_url"""
+    meta = gh_get(path)
+    if meta.get("encoding") == "base64" and meta.get("content"):
+        return base64.b64decode(meta["content"].replace("\n",""))
+    # Large file: use download_url
+    dl_url = meta.get("download_url")
+    if not dl_url:
+        raise Exception(f"No download_url for {path}")
+    req = urllib.request.Request(dl_url,
+        headers={"Authorization":f"token {GH_TOKEN}"})
+    with urllib.request.urlopen(req) as r:
+        return r.read()
 
 def gh_put(path, content_str, message="WHS Update"):
     content_b64 = base64.b64encode(content_str.encode()).decode()
