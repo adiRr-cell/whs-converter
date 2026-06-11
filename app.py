@@ -265,10 +265,22 @@ def gh_get_file_bytes(path):
 def gh_put(path, content_str, message="WHS Update"):
     content_b64 = base64.b64encode(content_str.encode()).decode()
     sha = None
-    try: 
-        meta = gh_get(path)
-        sha = meta.get("sha")
-    except: pass
+    # Always try to get SHA - file might exist
+    for attempt in range(3):
+        try: 
+            meta = gh_get(path)
+            sha = meta.get("sha")
+            print(f"gh_put: got SHA for {path}: {sha and sha[:8]}", flush=True)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"gh_put: {path} is new (404)", flush=True)
+                break
+            print(f"gh_put: SHA fetch attempt {attempt+1} failed: {e.code}", flush=True)
+            import time; time.sleep(1)
+        except Exception as e:
+            print(f"gh_put: SHA fetch error: {e}", flush=True)
+            break
     body = json.dumps({"message":message,"content":content_b64,**({"sha":sha} if sha else {})}).encode()
     print(f"gh_put: {path} size={len(content_b64)/1024/1024:.1f}MB sha={sha and sha[:8]}", flush=True)
     req = urllib.request.Request(
