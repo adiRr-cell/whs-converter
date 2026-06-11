@@ -1,5 +1,6 @@
 import os, base64, json, subprocess, tempfile, urllib.request, urllib.error, io, glob
 from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -16,9 +17,47 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO  = os.environ.get("GH_REPO", "adiRr-cell/forum-zero")
 IV       = int(os.environ.get("INTERVAL_MS", "10000"))
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "OPTIONS"])
 def health():
+    if request.method == "OPTIONS":
+        return "", 200
     return jsonify({"status": "ok", "service": "WHS Converter"})
+
+@app.route("/upload", methods=["POST", "OPTIONS"])
+def upload():
+    """Accept multipart form upload - avoids CORS preflight issues"""
+    if request.method == "OPTIONS":
+        return "", 200
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file"}), 400
+        f = request.files['file']
+        name = request.form.get('name', f.filename.replace('.pptx',''))
+        action = request.form.get('action', 'add')
+        pptx_bytes = f.read()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pptx_path = os.path.join(tmpdir, "input.pptx")
+            with open(pptx_path, "wb") as fp:
+                fp.write(pptx_bytes)
+            slides_b64 = convert_pptx(pptx_path, tmpdir)
+
+        if not slides_b64:
+            return jsonify({"error": "Nenhum slide gerado"}), 500
+
+        state = load_state()
+        from datetime import datetime
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        pres_id = "p" + str(int(datetime.now().timestamp() * 1000))
+        new_pres = {"id": pres_id, "name": name, "date": now,
+                    "slideCount": len(slides_b64), "thumb": slides_b64[0], "slides": slides_b64}
+        state.append(new_pres)
+        save_state(state)
+        rebuild_tv(state)
+        return jsonify({"ok": True, "id": pres_id, "name": name, "slideCount": len(slides_b64), "thumb": slides_b64[0]})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 @app.route("/process", methods=["POST"])
 def process():
