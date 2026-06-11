@@ -265,16 +265,24 @@ def gh_get_file_bytes(path):
 def gh_put(path, content_str, message="WHS Update"):
     content_b64 = base64.b64encode(content_str.encode()).decode()
     sha = None
-    try: sha = gh_get(path).get("sha")
+    try: 
+        meta = gh_get(path)
+        sha = meta.get("sha")
     except: pass
     body = json.dumps({"message":message,"content":content_b64,**({"sha":sha} if sha else {})}).encode()
+    print(f"gh_put: {path} size={len(content_b64)/1024/1024:.1f}MB sha={sha and sha[:8]}", flush=True)
     req = urllib.request.Request(
         f"https://api.github.com/repos/{GH_REPO}/contents/{path}",
         data=body, method="PUT",
         headers={"Authorization":f"token {GH_TOKEN}","Accept":"application/vnd.github.v3+json","Content-Type":"application/json"}
     )
-    with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"gh_put ERROR {e.code}: {err_body[:200]}", flush=True)
+        raise Exception(f"GitHub {e.code}: {err_body[:200]}")
 
 def gh_put_bytes(path, content_bytes, message="Upload"):
     content_b64 = base64.b64encode(content_bytes).decode()
