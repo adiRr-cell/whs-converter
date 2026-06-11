@@ -268,7 +268,7 @@ def gh_put(path, content_str, message="WHS Update"):
     # Always try to get SHA - file might exist
     for attempt in range(3):
         try: 
-            meta = gh_get(path)
+            meta = gh_get(f"contents/{path}")
             sha = meta.get("sha")
             print(f"gh_put: got SHA for {path}: {sha and sha[:8]}", flush=True)
             break
