@@ -257,7 +257,11 @@ def gh_delete(path, sha):
 def load_state():
     try:
         r = gh_get("contents/state.json")
-        return json.loads(base64.b64decode(r["content"].replace("\n","")).decode())
+        data = json.loads(base64.b64decode(r["content"].replace("\n","")).decode())
+        # Handle both formats: list or {"presentations": [...]}
+        if isinstance(data, list):
+            return data
+        return data.get("presentations", [])
     except: return []
 
 def save_state(state):
